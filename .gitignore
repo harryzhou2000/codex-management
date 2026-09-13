@@ -1,0 +1,10 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Generated outputs. Catalogs and plans record session titles, project paths, and excerpts of
+# user messages, so they stay out of the repository. Regenerate with:
+#   uv run csb catalog && uv run csb select
+catalog/
+plans/
