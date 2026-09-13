@@ -12,6 +12,7 @@ from . import backup, catalog, paths, selection, util
 
 DEFAULT_OLDER_THAN = "2026-08-31"
 DEFAULT_MIN_SIZE = "1GiB"
+THREAD_SOURCES = ("user", "subagent", "guardian_review", "orphan", "any")
 
 
 def _ellipsis(text: str, width: int) -> str:
@@ -46,14 +47,22 @@ def cmd_catalog(args: argparse.Namespace) -> int:
     )
     out_dir = Path(args.out)
     csv_path, json_path = catalog.write_outputs(rows, out_dir)
+
     stats = selection.summarize(rows)
-    sources: dict[str, int] = {}
+    sources = catalog.tree_stats(rows)
+    names: dict[str, int] = {}
     for row in rows:
-        sources[row["name_source"]] = sources.get(row["name_source"], 0) + 1
+        names[row["name_source"]] = names.get(row["name_source"], 0) + 1
     print(f"codex home:  {home}")
     print(f"sessions:    {stats['sessions']} rows ({sum(1 for r in rows if r['orphan'])} orphan files)")
     print(f"total size:  {stats['total_human']}")
-    print("names from:  " + ", ".join(f"{key}={value}" for key, value in sorted(sources.items())))
+    print(
+        "threads:     "
+        f"main agents={sources.get('user', 0)}, subagents={sources.get('subagent', 0)}, "
+        f"guardian_review={sources.get('guardian_review', 0)}, "
+        f"parent issues={sources.get('issues', 0)}"
+    )
+    print("names from:  " + ", ".join(f"{key}={value}" for key, value in sorted(names.items())))
     print(f"written:     {csv_path}")
     print(f"             {json_path}")
     return 0
@@ -70,7 +79,8 @@ def _load_catalog(path: Path) -> list[dict]:
         with path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         for row in rows:
-            for key in ("size_bytes", "turns", "tokens_used", "archived"):
+            for key in ("size_bytes", "turns", "tokens_used", "archived", "thread_depth",
+                        "subagent_count", "tree_size"):
                 row[key] = int(row.get(key) or 0)
             row["last_activity_epoch"] = float(row.get("last_activity_epoch") or 0)
             for key in ("exists", "orphan", "recently_active"):
@@ -81,7 +91,12 @@ def _load_catalog(path: Path) -> list[dict]:
 
 def cmd_select(args: argparse.Namespace) -> int:
     rows = _load_catalog(Path(args.catalog))
-    selected = selection.apply_filters(
+    sources = tuple(part.strip() for part in args.thread_source.split(",") if part.strip())
+    unknown = [source for source in sources if source not in THREAD_SOURCES]
+    if unknown:
+        raise SystemExit(f"unknown thread source(s): {', '.join(unknown)}")
+
+    selected, warnings = selection.apply_filters(
         rows,
         older_than=args.older_than,
         min_size=args.min_size,
@@ -89,27 +104,33 @@ def cmd_select(args: argparse.Namespace) -> int:
         include_orphans=not args.exclude_orphans,
         skip_recently_active=not args.include_active,
         min_turns=args.min_turns,
+        thread_sources=sources,
+        subagents=args.subagents,
     )
     stats = selection.summarize(selected)
+
     columns = [
         ("session_id", "session"), ("display_name", "name / title"), ("size_human", "size"),
-        ("last_activity", "last activity"), ("project_path", "project path"), ("token_h", "tokens"),
+        ("last_activity", "last activity"), ("project_path", "project path"),
+        ("role_label", "role"), ("tree_size", "tree"),
     ]
     for row in selected:
-        row["token_h"] = f"{row.get('tokens_used', 0) / 1_000_000:.1f}M" if row.get("tokens_used") else ""
-        row["display_name"] = _ellipsis(row.get("display_name") or "(untitled)", 42)
-        row["project_path"] = _tail_ellipsis(row.get("project_path") or "", 46)
-
+        row["display_name"] = _ellipsis(row.get("display_name") or "(untitled)", 40)
+        row["project_path"] = _tail_ellipsis(row.get("project_path") or "", 40)
     _print_table(selected, columns, args.limit)
+
     print()
     print(
-        f"criteria: last activity before {args.older_than}, size > {args.min_size}"
-        + (", archived excluded" if args.exclude_archived else "")
+        f"criteria: last activity before {args.older_than}, size > {args.min_size}, "
+        f"thread_source={','.join(sources)}, subagents={args.subagents}"
     )
     print(
-        f"selected: {stats['sessions']} sessions, {stats['total_human']}"
-        f" ({stats['archived_sessions']} archived)"
+        f"selected: {stats['sessions']} rollouts, {stats['total_human']} "
+        f"({stats['main_agents']} main agents, {stats['subagents']} subagents, "
+        f"{stats['archived_sessions']} archived)"
     )
+    for warning in warnings:
+        print(f"warning: {warning}")
 
     if args.out:
         out_dir = Path(args.out)
@@ -117,15 +138,31 @@ def cmd_select(args: argparse.Namespace) -> int:
         stem = args.name or "plan"
         json_path = out_dir / f"{stem}.json"
         csv_path = out_dir / f"{stem}.csv"
+        meta_path = out_dir / f"{stem}.meta.json"
         json_path.write_text(json.dumps(selected, indent=2), encoding="utf-8")
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(
-                handle, fieldnames=catalog.CSV_COLUMNS + ["reason"], extrasaction="ignore"
-            )
+            fields = catalog.CSV_COLUMNS + ["selection", "tree_root", "tree_depth", "reason"]
+            writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(selected)
+        meta_path.write_text(json.dumps({
+            "generated_at": util.dt.datetime.now(util.LOCAL_TZ).isoformat(timespec="seconds"),
+            "criteria": {
+                "older_than": args.older_than,
+                "min_size": args.min_size,
+                "thread_sources": list(sources),
+                "subagents": args.subagents,
+                "min_turns": args.min_turns,
+                "exclude_archived": args.exclude_archived,
+                "exclude_orphans": args.exclude_orphans,
+                "include_active": args.include_active,
+            },
+            "counts": stats,
+            "warnings": warnings,
+        }, indent=2), encoding="utf-8")
         print(f"plan written: {json_path}")
         print(f"              {csv_path}")
+        print(f"              {meta_path}")
     return 0
 
 
@@ -137,7 +174,7 @@ def cmd_backup(args: argparse.Namespace) -> int:
     archive_root = Path(args.archive_root).expanduser()
     if not args.apply:
         print("DRY RUN - nothing is written. Pass --apply to compress, plus --delete to prune.")
-    print(f"plan:         {plan_path} ({len(rows)} sessions)")
+    print(f"plan:         {plan_path} ({len(rows)} rollouts)")
     print(f"archive root: {archive_root}")
     results = backup.run(
         rows, archive_root=archive_root, apply=args.apply,
@@ -198,6 +235,12 @@ def build_parser() -> argparse.ArgumentParser:
     sel.add_argument("--min-size", default=DEFAULT_MIN_SIZE,
                      help=f"rollout size strictly greater than this (default {DEFAULT_MIN_SIZE})")
     sel.add_argument("--min-turns", type=int, default=None)
+    sel.add_argument("--thread-source", default="user",
+                     help="comma separated subset of user,subagent,guardian_review,orphan,any "
+                          "(default user: main agents only)")
+    sel.add_argument("--subagents", choices=("tree", "none"), default="tree",
+                     help="tree pulls every descendant of a selected main agent into the plan "
+                          "(default); none selects only the matching rows")
     sel.add_argument("--exclude-archived", action="store_true")
     sel.add_argument("--exclude-orphans", action="store_true")
     sel.add_argument("--include-active", action="store_true",

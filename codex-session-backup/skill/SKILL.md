@@ -48,6 +48,14 @@ prefix. Sessions forked from one another can share a headline, so quote the sess
   backup to capture the finished file.
 - Archives and mirrors must include archived_sessions/ as well as sessions/, otherwise archived
   sessions look deleted.
+- A selected main agent brings its whole subagent tree into the plan; --subagents tree is the
+  default. Never prune a subagent on its own: it is driven by its parent, and a half-moved tree
+  leaves dangling rollouts. Deepest threads are processed first, so children go before parents.
+- Parentage has to be unique. thread_spawn_edges keys the child, so its edge parent is unique; a
+  row whose parent is ambiguous, conflicting with agent_path, unresolved, or part of a cycle is
+  excluded from tree resolution and reported as a warning. Treat any such warning as a blocker:
+  the excluded subtree is not in the plan. Only main agents (thread_source user) are selected by
+  default; subagents and guardian_review threads require --thread-source.
 
 ## Authorization
 

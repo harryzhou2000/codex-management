@@ -70,6 +70,35 @@ select ANDs its filters; the defaults encode the current retention rule:
 The select table reports session id, name/title, size, last activity, project path, and tokens;
 the plan JSON/CSV carry every catalog column.
 
+### Thread kinds and subagent trees
+
+- thread_source user: a main agent, started by a person. Only these are selected by default.
+- thread_source subagent: spawned by a parent agent and driven only by it (1368 of the 1545
+  threads in this Codex home).
+- thread_source guardian_review: automated review threads, neither user-driven nor subagents.
+- orphan: a rollout file with no row in state_*.sqlite.
+
+Parentage comes from thread_spawn_edges, whose child_thread_id is the primary key, so a subagent
+has exactly one parent there. agent_path is a cross-check: a child path is its parent path plus
+one segment. The catalog records parent_thread_id, parent_source (edge|path), parent_issue,
+root_thread_id, thread_depth, subagent_count, and tree_size per row.
+
+select defaults to --thread-source user --subagents tree, so a selected main agent brings its
+whole descendant set into the plan even when individual subagent rollouts are small or recent: a
+session tree moves or stays as a unit. Use --subagents none to take only the rows matching the
+criteria, or --thread-source subagent / guardian_review / any to inspect those threads directly.
+
+Uniqueness is enforced rather than assumed. A child whose parent is ambiguous (an agent_path
+matching more than one thread), conflicting (the edge parent differs from the path parent),
+unresolved, or part of a cycle is never attached: it is dropped from the tree along with its own
+subtree, and the run reports a warning that lands in the plan's meta file. The guards are
+covered by tests:
+
+    uv run --no-sync python -m unittest discover -s tests -t .
+
+backup processes rows deepest first, so a subagent rollout is archived and pruned before the
+parent it belongs to.
+
 ## Archive layout
 
     <archive-root>/                  # default ~/ssd1/bkp/codex_sessions

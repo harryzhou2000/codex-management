@@ -137,6 +137,8 @@ def backup_one(
         "title": row.get("title", ""),
         "cwd": row.get("cwd", ""),
         "last_activity": row.get("last_activity", ""),
+        "role_label": row.get("role_label", ""),
+        "tree_root": row.get("tree_root", ""),
         "deleted_source": False,
     }
 
@@ -169,8 +171,10 @@ def run(
 ) -> list[dict]:
     archive_root = archive_root.expanduser()
     ledger = load_ledger(archive_root / LEDGER_NAME)
+    # Deepest threads first, so a subagent is archived and pruned before its parent.
+    ordered = sorted(rows, key=lambda row: row.get("thread_depth", 0), reverse=True)
     results = []
-    for row in rows:
+    for row in ordered:
         result = backup_one(
             row, archive_root=archive_root, ledger=ledger,
             apply=apply, delete=delete, level=level, force=force,

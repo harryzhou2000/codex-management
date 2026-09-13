@@ -19,6 +19,10 @@ Local tooling for keeping Codex data manageable.
 
 Standard library only. zstd is the one external binary the backup step needs.
 
+Tree-resolution guards (unique parentage, no double attachment, excluded ambiguous rows):
+
+    cd codex-session-backup && uv run --no-sync python -m unittest discover -s tests -t .
+
 ## Layout notes
 
 The skill exists twice: .codex/skills/codex-session-backup/SKILL.md is the discoverable copy

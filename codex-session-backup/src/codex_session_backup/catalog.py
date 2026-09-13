@@ -1,4 +1,16 @@
-"""Build a session catalog from Codex databases plus the rollout tree."""
+"""Build a session catalog from Codex databases plus the rollout tree.
+
+Codex models three kinds of threads:
+
+- main agents (thread_source "user"): started by a person, can take user input;
+- subagents (thread_source "subagent"): spawned by another thread, driven only by the parent;
+- guardian reviews (thread_source "guardian_review"): automated review threads.
+
+Parentage comes from thread_spawn_edges, whose child_thread_id is the primary key, so a subagent
+has exactly one parent there. agent_path is a weaker second signal (a child path is its parent
+path plus one segment) used as a cross-check: a disagreement, an ambiguous path match, or a
+cycle is recorded as a parent_issue instead of being resolved silently.
+"""
 
 from __future__ import annotations
 
@@ -10,10 +22,13 @@ from pathlib import Path
 from . import paths, util
 
 CSV_COLUMNS = [
-    "session_id", "display_name", "name_source", "name", "title", "archived", "tree", "exists",
-    "orphan", "size_bytes", "size_human", "last_activity", "recently_active", "rollout_path",
-    "project_path", "cwd", "created", "updated", "turns", "tokens_used", "cli_version",
-    "git_branch", "model", "first_user_message",
+    "session_id", "display_name", "name_source", "name", "title", "thread_source",
+    "role_label", "thread_depth", "parent_thread_id", "parent_source", "parent_issue",
+    "root_thread_id", "subagent_count", "tree_size", "agent_path", "agent_nickname",
+    "agent_role", "archived", "tree", "exists", "orphan", "size_bytes", "size_human",
+    "last_activity", "recently_active", "rollout_path", "project_path", "cwd", "created",
+    "updated", "turns", "tokens_used", "cli_version", "git_branch", "model",
+    "first_user_message",
 ]
 
 # Text the agent injects into the transcript; never a user-authored session headline.
@@ -31,6 +46,9 @@ TRIVIAL_MESSAGES = {
 }
 
 MIN_HEADLINE_CHARS = 12
+
+# The symbolic parent of a top-level subagent path; the main agent carries no agent_path.
+ROOT_PATH = "/root"
 
 
 def meaningful(text: str | None, min_chars: int = 8) -> bool:
@@ -100,10 +118,12 @@ def resolve_display_name(thread: dict, path: Path | None, scan_bytes: int) -> tu
             return headline, "rollout_head"
     return "", "none"
 
+
 THREAD_COLUMNS = [
     "id", "name", "title", "first_user_message", "cwd", "rollout_path", "created_at",
     "updated_at", "created_at_ms", "updated_at_ms", "archived", "archived_at", "tokens_used",
-    "cli_version", "git_branch", "model", "source", "model_provider",
+    "cli_version", "git_branch", "model", "source", "model_provider", "thread_source",
+    "agent_path", "agent_nickname", "agent_role",
 ]
 
 
@@ -113,12 +133,36 @@ def _connect(path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    row = connection.execute(
+        "select 1 from sqlite_master where type = 'table' and name = ?", (table,)
+    ).fetchone()
+    return row is not None
+
+
 def fetch_threads(db: Path) -> list[dict]:
     with _connect(db) as connection:
         # Column sets differ between Codex releases; select only what this database has.
         available = {row["name"] for row in connection.execute("pragma table_info(threads)")}
         columns = [column for column in THREAD_COLUMNS if column in available]
         return [dict(row) for row in connection.execute(f"select {', '.join(columns)} from threads")]
+
+
+def fetch_spawn_edges(db: Path) -> dict[str, str]:
+    """child thread id -> parent thread id. child_thread_id is the table's primary key."""
+
+    try:
+        with _connect(db) as connection:
+            if not _table_exists(connection, "thread_spawn_edges"):
+                return {}
+            return {
+                row["child_thread_id"]: row["parent_thread_id"]
+                for row in connection.execute(
+                    "select parent_thread_id, child_thread_id from thread_spawn_edges"
+                )
+            }
+    except sqlite3.Error:
+        return {}
 
 
 def fetch_turn_counts(db: Path | None) -> dict[str, int]:
@@ -158,6 +202,102 @@ def classify(path: Path | None, home: Path) -> str:
     return relative.parts[0] if relative.parts else "external"
 
 
+def resolve_parent(
+    session_id: str, agent_path: str, edges: dict[str, str], path_index: dict[str, list[str]]
+) -> tuple[str | None, str, str]:
+    """Return (parent_id, parent_source, issue) using the edge table first, then agent_path."""
+
+    edge_parent = edges.get(session_id)
+    path_parent: str | None = None
+    path_issue = ""
+    path = (agent_path or "").strip()
+    if path and "/" in path:
+        parent_path = path.rsplit("/", 1)[0]
+        if parent_path and parent_path != ROOT_PATH:
+            candidates = path_index.get(parent_path, [])
+            if len(candidates) == 1:
+                path_parent = candidates[0]
+            elif len(candidates) > 1:
+                path_issue = "ambiguous-parent-path"
+            else:
+                path_issue = "unresolved-parent-path"
+
+    if edge_parent and path_parent and edge_parent != path_parent:
+        return edge_parent, "edge", "parent-conflict"
+    if edge_parent:
+        return edge_parent, "edge", ""
+    if path_parent:
+        return path_parent, "path", ""
+    return None, "", path_issue
+
+
+def walk_ancestry(start: str, parent_of: dict[str, str]) -> tuple[list[str], bool]:
+    """Chain from start to its root, plus a cycle flag."""
+
+    chain: list[str] = []
+    seen: set[str] = set()
+    current: str | None = start
+    while current is not None:
+        if current in seen:
+            return chain, True
+        seen.add(current)
+        chain.append(current)
+        current = parent_of.get(current)
+    return chain, False
+
+
+def build_tree(
+    ids: list[str], parent_of: dict[str, str], issues: dict[str, str]
+) -> tuple[dict[str, str], dict[str, int], dict[str, int], dict[str, str]]:
+    """Resolve roots, depths, descendant counts. Cycles are flagged and detached."""
+
+    cyclic: set[str] = set()
+    for session_id in ids:
+        if session_id in parent_of:
+            chain, is_cycle = walk_ancestry(session_id, parent_of)
+            if is_cycle:
+                cyclic.update(chain)
+    for session_id in cyclic:
+        parent_of.pop(session_id, None)
+        issues[session_id] = "cycle"
+
+    roots: dict[str, str] = {}
+    depths: dict[str, int] = {}
+    for session_id in ids:
+        if session_id in cyclic:
+            continue
+        chain, _ = walk_ancestry(session_id, parent_of)
+        roots[session_id] = chain[-1]
+        depths[session_id] = len(chain) - 1
+
+    children: dict[str, list[str]] = {}
+    for child, parent in parent_of.items():
+        if child in cyclic:
+            continue
+        children.setdefault(parent, []).append(child)
+
+    counts: dict[str, int] = {}
+    for session_id in ids:
+        if session_id in cyclic:
+            counts[session_id] = 0
+            continue
+        total = 0
+        stack = list(children.get(session_id, []))
+        while stack:
+            total += 1
+            stack.extend(children.get(stack.pop(), []))
+        counts[session_id] = total
+    return roots, depths, counts, issues
+
+
+def role_label(thread_source: str, depth: int | None) -> str:
+    if thread_source == "user":
+        return "main"
+    if thread_source == "subagent":
+        return f"sub d{depth}" if depth is not None else "sub"
+    return thread_source or "unknown"
+
+
 def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 1024) -> list[dict]:
     state = paths.state_db(home)
     if state is None or not state.exists():
@@ -165,12 +305,34 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
 
     threads = fetch_threads(state)
     turns = fetch_turn_counts(paths.thread_history_db(home))
+    edges = fetch_spawn_edges(state)
     index = index_rollouts(home)
     now = util.dt.datetime.now().timestamp()
-    rows: list[dict] = []
 
-    for thread in threads:
-        session_id = thread.get("id") or ""
+    by_id = {thread.get("id") or "": thread for thread in threads}
+    path_index: dict[str, list[str]] = {}
+    for session_id, thread in by_id.items():
+        path = (thread.get("agent_path") or "").strip()
+        if path:
+            path_index.setdefault(path, []).append(session_id)
+
+    parent_of: dict[str, str] = {}
+    parent_source: dict[str, str] = {}
+    issues: dict[str, str] = {}
+    for session_id, thread in by_id.items():
+        parent, source, issue = resolve_parent(
+            session_id, thread.get("agent_path") or "", edges, path_index
+        )
+        if parent:
+            parent_of[session_id] = parent
+            parent_source[session_id] = source
+        if issue:
+            issues[session_id] = issue
+
+    roots, depths, counts, issues = build_tree(list(by_id), parent_of, issues)
+
+    rows: list[dict] = []
+    for session_id, thread in by_id.items():
         recorded_path = thread.get("rollout_path") or ""
         recorded = Path(recorded_path) if recorded_path else None
         path = index.get(session_id) or (recorded if recorded and recorded.exists() else None)
@@ -181,23 +343,37 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
             float(updated_at_ms) / 1000.0 if updated_at_ms else float(thread.get("updated_at") or 0)
         )
         cwd = thread.get("cwd") or ""
+        thread_source = thread.get("thread_source") or ""
+        depth = depths.get(session_id)
         display_name, name_source = resolve_display_name(thread, path, scan_bytes)
         rows.append({
             "session_id": session_id,
             "display_name": display_name,
             "name_source": name_source,
             "name": (thread.get("name") or "").strip()[:120],
+            "title": (thread.get("title") or "").strip()[:120],
+            "thread_source": thread_source,
+            "role_label": role_label(thread_source, depth),
+            "thread_depth": depth if depth is not None else -1,
+            "parent_thread_id": parent_of.get(session_id, ""),
+            "parent_source": parent_source.get(session_id, ""),
+            "parent_issue": issues.get(session_id, ""),
+            "root_thread_id": roots.get(session_id, session_id),
+            "subagent_count": counts.get(session_id, 0),
+            "tree_size": counts.get(session_id, 0) + 1,
+            "agent_path": (thread.get("agent_path") or "").strip(),
+            "agent_nickname": thread.get("agent_nickname") or "",
+            "agent_role": thread.get("agent_role") or "",
+            "archived": int(thread.get("archived") or 0),
             "tree": classify(path, home),
             "exists": bool(path),
             "orphan": False,
-            "archived": int(thread.get("archived") or 0),
             "size_bytes": size,
             "size_human": util.human_size(size),
             "last_activity": util.local_iso(last_activity),
             "last_activity_epoch": last_activity,
             "recently_active": bool(last_activity and (now - last_activity) < recent_minutes * 60),
             "rollout_path": str(path) if path else recorded_path,
-            "title": (thread.get("title") or "").strip()[:120],
             "project_path": pretty_path(cwd),
             "project": Path(cwd).name if cwd else "",
             "cwd": cwd,
@@ -211,7 +387,7 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
             "first_user_message": (thread.get("first_user_message") or "").strip()[:160],
         })
 
-    known = {thread.get("id") for thread in threads}
+    known = set(by_id)
     for session_id, path in sorted(index.items()):
         if session_id in known:
             continue
@@ -221,25 +397,38 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
             "session_id": session_id,
             "display_name": "",
             "name_source": "none",
-            "name": "",
+            "name": "", "title": "(no state row)",
+            "thread_source": "orphan",
+            "role_label": "orphan",
+            "thread_depth": 0,
+            "parent_thread_id": "", "parent_source": "", "parent_issue": "",
+            "root_thread_id": session_id, "subagent_count": 0, "tree_size": 1,
+            "agent_path": "", "agent_nickname": "", "agent_role": "",
+            "archived": 1 if path.parent == paths.archived_dir(home) else 0,
             "tree": classify(path, home),
             "exists": True,
             "orphan": True,
-            "archived": 1 if path.parent == paths.archived_dir(home) else 0,
             "size_bytes": size,
             "size_human": util.human_size(size),
             "last_activity": util.local_iso(mtime),
             "last_activity_epoch": mtime,
             "recently_active": bool(mtime and (now - mtime) < recent_minutes * 60),
             "rollout_path": str(path),
-            "title": "(no state row)",
-            "project_path": "",
-            "project": "", "cwd": "",
+            "project_path": "", "project": "", "cwd": "",
             "created": util.local_iso(mtime), "updated": util.local_iso(mtime),
             "turns": 0, "tokens_used": 0, "cli_version": "", "git_branch": "",
             "model": "", "first_user_message": "",
         })
     return rows
+
+
+def tree_stats(rows: list[dict]) -> dict[str, int]:
+    stats: dict[str, int] = {}
+    for row in rows:
+        key = row.get("thread_source") or "unknown"
+        stats[key] = stats.get(key, 0) + 1
+    stats["issues"] = sum(1 for row in rows if row.get("parent_issue"))
+    return stats
 
 
 def write_outputs(rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
