@@ -1,7 +1,11 @@
 """Compress rollouts into an archive root, verify them, and optionally hand deletion to the CLI.
 
-Nothing in this module writes to the Codex home. Deletion is delegated to the codex delete
-command, which is the only component that keeps state_*.sqlite consistent with the rollout tree.
+Nothing here writes to the Codex home. Deletion is delegated to the codex delete command, which
+is the only component that keeps state_*.sqlite consistent with the rollout tree.
+
+An existing archive never blocks a requested deletion: when the ledger already holds a verified
+copy, that copy is re-hashed and the session is deleted without recompressing. A deletion is
+refused outright if the archive is missing or its hash no longer matches.
 """
 
 from __future__ import annotations
@@ -77,6 +81,27 @@ def _target(archive_root: Path, row: dict) -> Path:
     return archive_root / month / f"{row['session_id']}.jsonl.zst"
 
 
+def _delete_session(session_id: str, src: Path) -> tuple[str, dict]:
+    """Run codex delete and report what actually happened on disk."""
+
+    # Outside an interactive terminal the CLI demands --force plus a session UUID; plans always
+    # carry UUIDs, so this is the non-interactive form of the same command.
+    command = ["codex", "delete", "--force", session_id]
+    result = subprocess.run(command, capture_output=True, text=True)
+    output = (result.stdout + result.stderr).strip()[:400]
+    source_gone = not src.exists()
+    info = {
+        "delete_command": " ".join(command),
+        "delete_returncode": result.returncode,
+        "delete_output": output,
+        "deleted_source": bool(result.returncode == 0 and source_gone),
+        "source_still_present": not source_gone,
+    }
+    if result.returncode != 0:
+        return "delete-failed", info
+    return ("deleted", info) if source_gone else ("delete-incomplete:file-remains", info)
+
+
 def backup_one(
     row: dict,
     *,
@@ -104,59 +129,80 @@ def backup_one(
     if row.get("size_bytes") and size != row["size_bytes"]:
         outcome["action"] = "skipped:size-changed"
         return outcome
-    previous = ledger.get(row["session_id"])
-    if previous and previous.get("verified") and not force:
-        if previous.get("src_size") == size:
-            outcome["action"] = "skipped:already-backed-up"
-            outcome["archive"] = previous.get("archive_path", "")
-            return outcome
 
+    previous = ledger.get(row["session_id"])
+    reused = bool(
+        previous and previous.get("verified") and previous.get("src_size") == size and not force
+    )
+
+    if reused and not delete:
+        outcome["action"] = "skipped:already-backed-up"
+        outcome["archive"] = previous.get("archive_path", "")
+        return outcome
+    if reused and previous.get("deleted_source"):
+        outcome["action"] = "skipped:already-deleted"
+        return outcome
+
+    archive: Path | None = None
+    if reused:
+        archive = Path(previous.get("archive_path", ""))
+        if not archive.exists():
+            # Deleting without the copy is the one thing that must never happen.
+            outcome["action"] = "failed:archive-missing"
+            return outcome
     if not apply:
         return outcome
 
-    src_hash = util.sha256_file(src)
-    compress(src, dst, level=level)
-    decoded = decoded_sha256(dst)
-    if decoded != src_hash:
-        outcome["action"] = "failed:hash-mismatch"
-        outcome["src_sha256"] = src_hash
-        outcome["decoded_sha256"] = decoded
-        return outcome
-
-    record = {
-        "session_id": row["session_id"],
-        "backed_up_at": util.dt.datetime.now(util.LOCAL_TZ).isoformat(timespec="seconds"),
-        "src_path": str(src),
-        "src_size": size,
-        "src_sha256": src_hash,
-        "src_mtime": util.local_iso(src.stat().st_mtime),
-        "archive_path": str(dst),
-        "archive_size": dst.stat().st_size,
-        "decoded_sha256": decoded,
-        "verified": True,
-        "title": row.get("title", ""),
-        "cwd": row.get("cwd", ""),
-        "last_activity": row.get("last_activity", ""),
-        "role_label": row.get("role_label", ""),
-        "tree_root": row.get("tree_root", ""),
-        "deleted_source": False,
-    }
-
-    if delete:
-        result = subprocess.run(
-            ["codex", "delete", row["session_id"]], capture_output=True, text=True
-        )
-        record["delete_command"] = "codex delete"
-        record["delete_returncode"] = result.returncode
-        record["delete_output"] = (result.stdout + result.stderr).strip()[:400]
-        record["deleted_source"] = result.returncode == 0
-        outcome["action"] = "backed-up+deleted" if record["deleted_source"] else "backed-up:delete-failed"
+    if reused:
+        if decoded_sha256(archive) != previous.get("decoded_sha256"):
+            outcome["action"] = "failed:archive-hash-mismatch"
+            return outcome
+        record = dict(previous)
+        record["reused_archive"] = True
+        outcome["action"] = "verified-existing-archive"
     else:
+        src_hash = util.sha256_file(src)
+        compress(src, dst, level=level)
+        decoded = decoded_sha256(dst)
+        if decoded != src_hash:
+            outcome["action"] = "failed:hash-mismatch"
+            outcome["src_sha256"] = src_hash
+            outcome["decoded_sha256"] = decoded
+            return outcome
+        record = {
+            "session_id": row["session_id"],
+            "backed_up_at": util.dt.datetime.now(util.LOCAL_TZ).isoformat(timespec="seconds"),
+            "src_path": str(src),
+            "src_size": size,
+            "src_sha256": src_hash,
+            "src_mtime": util.local_iso(src.stat().st_mtime),
+            "archive_path": str(dst),
+            "archive_size": dst.stat().st_size,
+            "decoded_sha256": decoded,
+            "verified": True,
+            "title": row.get("title", ""),
+            "cwd": row.get("cwd", ""),
+            "last_activity": row.get("last_activity", ""),
+            "role_label": row.get("role_label", ""),
+            "tree_root": row.get("tree_root", ""),
+            "deleted_source": False,
+        }
         outcome["action"] = "backed-up"
 
-    append_ledger(archive_root / LEDGER_NAME, record)
+    if delete:
+        action, info = _delete_session(row["session_id"], src)
+        record.update(info)
+        outcome["action"] = (
+            f"{action}:archive-reused" if reused else f"{action}:just-archived"
+        )
+        archive_path = record.get("archive_path")
+        if archive_path:
+            outcome["archive"] = archive_path
+
+    if not reused or delete:
+        append_ledger(archive_root / LEDGER_NAME, record)
     ledger[row["session_id"]] = record
-    outcome.update({"src_sha256": src_hash, "archive": str(dst), "archive_size": record["archive_size"]})
+    outcome.setdefault("archive", str(dst))
     return outcome
 
 
@@ -174,14 +220,14 @@ def run(
     # Deepest threads first, so a subagent is archived and pruned before its parent.
     ordered = sorted(rows, key=lambda row: row.get("thread_depth", 0), reverse=True)
     results = []
-    for row in ordered:
+    for index, row in enumerate(ordered, start=1):
         result = backup_one(
             row, archive_root=archive_root, ledger=ledger,
             apply=apply, delete=delete, level=level, force=force,
         )
         results.append(result)
         print(
-            f"  {result['action']:<26} {result['session_id']}  {util.human_size(result['size_bytes'])}",
+            f"  [{index:>4}/{len(ordered)}] {result['action']:<32} {result['session_id']}",
             file=sys.stderr,
         )
     return results
