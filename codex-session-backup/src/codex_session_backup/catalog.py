@@ -24,7 +24,8 @@ from . import paths, util
 CSV_COLUMNS = [
     "session_id", "display_name", "name_source", "name", "title", "thread_source",
     "role_label", "thread_depth", "parent_thread_id", "parent_source", "parent_issue",
-    "root_thread_id", "subagent_count", "tree_size", "agent_path", "agent_nickname",
+    "root_thread_id", "subagent_count", "tree_size", "tree_bytes", "tree_size_human",
+    "tree_latest_activity", "tree_recently_active", "agent_path", "agent_nickname",
     "agent_role", "archived", "tree", "exists", "orphan", "size_bytes", "size_human",
     "last_activity", "recently_active", "rollout_path", "project_path", "cwd", "created",
     "updated", "turns", "tokens_used", "cli_version", "git_branch", "model",
@@ -247,9 +248,17 @@ def walk_ancestry(start: str, parent_of: dict[str, str]) -> tuple[list[str], boo
 
 
 def build_tree(
-    ids: list[str], parent_of: dict[str, str], issues: dict[str, str]
-) -> tuple[dict[str, str], dict[str, int], dict[str, int], dict[str, str]]:
-    """Resolve roots, depths, descendant counts. Cycles are flagged and detached."""
+    ids: list[str],
+    parent_of: dict[str, str],
+    issues: dict[str, str],
+    sizes: dict[str, int],
+    activity: dict[str, float],
+) -> tuple[dict[str, str], dict[str, int], dict[str, int], dict[str, int], dict[str, float], dict[str, str]]:
+    """Resolve roots, depths, descendant counts, tree bytes and newest member activity.
+
+    Cycles are flagged and detached. Tree totals cover the whole subtree, which is what a
+    tree-level criterion and the recently-active guard need.
+    """
 
     cyclic: set[str] = set()
     for session_id in ids:
@@ -277,17 +286,30 @@ def build_tree(
         children.setdefault(parent, []).append(child)
 
     counts: dict[str, int] = {}
+    totals: dict[str, int] = {}
+    latest: dict[str, float] = {}
     for session_id in ids:
+        own_size = sizes.get(session_id, 0)
+        own_activity = activity.get(session_id, 0.0)
         if session_id in cyclic:
             counts[session_id] = 0
+            totals[session_id] = own_size
+            latest[session_id] = own_activity
             continue
-        total = 0
+        descendants = 0
+        total_bytes = own_size
+        newest = own_activity
         stack = list(children.get(session_id, []))
         while stack:
-            total += 1
-            stack.extend(children.get(stack.pop(), []))
-        counts[session_id] = total
-    return roots, depths, counts, issues
+            child = stack.pop()
+            descendants += 1
+            total_bytes += sizes.get(child, 0)
+            newest = max(newest, activity.get(child, 0.0))
+            stack.extend(children.get(child, []))
+        counts[session_id] = descendants
+        totals[session_id] = total_bytes
+        latest[session_id] = newest
+    return roots, depths, counts, totals, latest, issues
 
 
 def role_label(thread_source: str, depth: int | None) -> str:
@@ -329,19 +351,32 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
         if issue:
             issues[session_id] = issue
 
-    roots, depths, counts, issues = build_tree(list(by_id), parent_of, issues)
-
-    rows: list[dict] = []
+    resolved_path: dict[str, Path | None] = {}
+    sizes: dict[str, int] = {}
+    activity: dict[str, float] = {}
     for session_id, thread in by_id.items():
         recorded_path = thread.get("rollout_path") or ""
         recorded = Path(recorded_path) if recorded_path else None
         path = index.get(session_id) or (recorded if recorded and recorded.exists() else None)
-        size = util.size_or_zero(path) if path else 0
+        resolved_path[session_id] = path
+        sizes[session_id] = util.size_or_zero(path) if path else 0
         mtime = util.mtime_or_zero(path) if path else 0.0
         updated_at_ms = thread.get("updated_at_ms") or 0
-        last_activity = mtime or (
+        activity[session_id] = mtime or (
             float(updated_at_ms) / 1000.0 if updated_at_ms else float(thread.get("updated_at") or 0)
         )
+
+    roots, depths, counts, totals, latest, issues = build_tree(
+        list(by_id), parent_of, issues, sizes, activity
+    )
+
+    rows: list[dict] = []
+    for session_id, thread in by_id.items():
+        recorded_path = thread.get("rollout_path") or ""
+        path = resolved_path.get(session_id)
+        size = sizes.get(session_id, 0)
+        last_activity = activity.get(session_id, 0.0)
+        updated_at_ms = thread.get("updated_at_ms") or 0
         cwd = thread.get("cwd") or ""
         thread_source = thread.get("thread_source") or ""
         depth = depths.get(session_id)
@@ -361,6 +396,12 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
             "root_thread_id": roots.get(session_id, session_id),
             "subagent_count": counts.get(session_id, 0),
             "tree_size": counts.get(session_id, 0) + 1,
+            "tree_bytes": totals.get(session_id, size),
+            "tree_size_human": util.human_size(totals.get(session_id, size)),
+            "tree_latest_activity": util.local_iso(latest.get(session_id, 0.0)),
+            "tree_recently_active": bool(
+                latest.get(session_id) and (now - latest[session_id]) < recent_minutes * 60
+            ),
             "agent_path": (thread.get("agent_path") or "").strip(),
             "agent_nickname": thread.get("agent_nickname") or "",
             "agent_role": thread.get("agent_role") or "",
@@ -403,6 +444,9 @@ def build_rows(home: Path, recent_minutes: int = 15, scan_bytes: int = 1024 * 10
             "thread_depth": 0,
             "parent_thread_id": "", "parent_source": "", "parent_issue": "",
             "root_thread_id": session_id, "subagent_count": 0, "tree_size": 1,
+            "tree_bytes": size, "tree_size_human": util.human_size(size),
+            "tree_latest_activity": util.local_iso(mtime),
+            "tree_recently_active": bool(mtime and (now - mtime) < recent_minutes * 60),
             "agent_path": "", "agent_nickname": "", "agent_role": "",
             "archived": 1 if path.parent == paths.archived_dir(home) else 0,
             "tree": classify(path, home),

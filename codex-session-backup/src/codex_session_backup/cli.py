@@ -80,7 +80,7 @@ def _load_catalog(path: Path) -> list[dict]:
             rows = list(csv.DictReader(handle))
         for row in rows:
             for key in ("size_bytes", "turns", "tokens_used", "archived", "thread_depth",
-                        "subagent_count", "tree_size"):
+                        "subagent_count", "tree_size", "tree_bytes"):
                 row[key] = int(row.get(key) or 0)
             row["last_activity_epoch"] = float(row.get("last_activity_epoch") or 0)
             for key in ("exists", "orphan", "recently_active"):
@@ -104,6 +104,7 @@ def cmd_select(args: argparse.Namespace) -> int:
         include_orphans=not args.exclude_orphans,
         skip_recently_active=not args.include_active,
         min_turns=args.min_turns,
+        min_tree_size=args.min_tree_size,
         thread_sources=sources,
         subagents=args.subagents,
     )
@@ -112,16 +113,17 @@ def cmd_select(args: argparse.Namespace) -> int:
     columns = [
         ("session_id", "session"), ("display_name", "name / title"), ("size_human", "size"),
         ("last_activity", "last activity"), ("project_path", "project path"),
-        ("role_label", "role"), ("tree_size", "tree"),
+        ("role_label", "role"), ("tree_size_human", "tree total"),
     ]
     for row in selected:
-        row["display_name"] = _ellipsis(row.get("display_name") or "(untitled)", 40)
-        row["project_path"] = _tail_ellipsis(row.get("project_path") or "", 40)
+        row["display_name"] = _ellipsis(row.get("display_name") or "(untitled)", 36)
+        row["project_path"] = _tail_ellipsis(row.get("project_path") or "", 36)
     _print_table(selected, columns, args.limit)
 
     print()
+    tree_part = f", tree total > {args.min_tree_size}" if args.min_tree_size else ""
     print(
-        f"criteria: last activity before {args.older_than}, size > {args.min_size}, "
+        f"criteria: last activity before {args.older_than}, row size > {args.min_size}{tree_part}, "
         f"thread_source={','.join(sources)}, subagents={args.subagents}"
     )
     print(
@@ -150,6 +152,7 @@ def cmd_select(args: argparse.Namespace) -> int:
             "criteria": {
                 "older_than": args.older_than,
                 "min_size": args.min_size,
+                "min_tree_size": args.min_tree_size,
                 "thread_sources": list(sources),
                 "subagents": args.subagents,
                 "min_turns": args.min_turns,
@@ -234,6 +237,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help=f"last activity strictly before this date (default {DEFAULT_OLDER_THAN})")
     sel.add_argument("--min-size", default=DEFAULT_MIN_SIZE,
                      help=f"rollout size strictly greater than this (default {DEFAULT_MIN_SIZE})")
+    sel.add_argument("--min-tree-size", default=None,
+                     help="whole-tree size (own rollout plus every descendant) strictly greater "
+                          "than this, to keep or drop a session as a unit")
     sel.add_argument("--min-turns", type=int, default=None)
     sel.add_argument("--thread-source", default="user",
                      help="comma separated subset of user,subagent,guardian_review,orphan,any "

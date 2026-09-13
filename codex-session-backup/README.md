@@ -65,6 +65,10 @@ select ANDs its filters; the defaults encode the current retention rule:
 - --older-than: last activity strictly before that local date (YYYY-MM-DD or YYYY/MM/DD).
 - --min-size: rollout size strictly greater than the given size; SI and IEC units both accepted
   (1GB = 1000^3, 1GiB = 1024^3).
+- --min-tree-size: whole-tree size, meaning a session's own rollout plus every descendant,
+  strictly greater than the given size. Use it when a session should be judged as a unit; the
+  second-largest main-agent tree here is 0.42 GiB, so this is the criterion that matters once
+  subagent sprawl explains the size.
 - --min-turns, --exclude-archived, --exclude-orphans, --include-active
 
 The select table reports session id, name/title, size, last activity, project path, and tokens;
@@ -95,6 +99,11 @@ subtree, and the run reports a warning that lands in the plan's meta file. The g
 covered by tests:
 
     uv run --no-sync python -m unittest discover -s tests -t .
+
+The same caution applies to liveness. --min-size and --older-than describe a single rollout,
+while the catalog also records tree_bytes, tree_latest_activity, and tree_recently_active. In
+tree mode a selected tree containing a rollout touched within --recent-minutes is dropped in
+full, with a warning, because a live descendant makes the whole tree unsafe to move.
 
 backup processes rows deepest first, so a subagent rollout is archived and pruned before the
 parent it belongs to.

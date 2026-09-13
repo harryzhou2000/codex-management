@@ -56,6 +56,10 @@ prefix. Sessions forked from one another can share a headline, so quote the sess
   excluded from tree resolution and reported as a warning. Treat any such warning as a blocker:
   the excluded subtree is not in the plan. Only main agents (thread_source user) are selected by
   default; subagents and guardian_review threads require --thread-source.
+- Size criteria differ: --min-size tests one rollout file, --min-tree-size tests the whole tree
+  (own rollout plus descendants), which is the one that reflects subagent sprawl. A tree
+  containing a rollout touched within --recent-minutes is dropped in full with a warning, so a
+  live tree is never moved or deleted.
 
 ## Authorization
 

@@ -20,12 +20,14 @@ from . import util
 MAIN_SOURCE = "user"
 
 
-def _reason(older_than: str | None, min_size: str | None) -> str:
+def _reason(older_than: str | None, min_size: str | None, min_tree_size: str | None = None) -> str:
     parts = []
     if older_than:
         parts.append(f"last activity before {older_than}")
     if min_size:
         parts.append(f"size > {min_size}")
+    if min_tree_size:
+        parts.append(f"tree total > {min_tree_size}")
     return "; ".join(parts)
 
 
@@ -50,6 +52,7 @@ def apply_filters(
     *,
     older_than: str | None = None,
     min_size: str | None = None,
+    min_tree_size: str | None = None,
     include_archived: bool = True,
     include_orphans: bool = False,
     skip_recently_active: bool = True,
@@ -61,6 +64,7 @@ def apply_filters(
 
     cutoff = util.parse_date(older_than).timestamp() if older_than else None
     floor = util.parse_size(min_size) if min_size else None
+    tree_floor = util.parse_size(min_tree_size) if min_tree_size else None
     catalog = list(rows)
     children, blocked = _children_index(catalog)
     wanted = {source.lower() for source in thread_sources}
@@ -83,20 +87,27 @@ def apply_filters(
                 continue
         if floor is not None and row.get("size_bytes", 0) <= floor:
             continue
+        if tree_floor is not None and row.get("tree_bytes", 0) <= tree_floor:
+            continue
         if min_turns is not None and row.get("turns", 0) < min_turns:
             continue
         item = dict(row)
         item["selection"] = "criteria"
         item["tree_root"] = row.get("session_id")
         item["tree_depth"] = 0
-        item["reason"] = _reason(older_than, min_size)
+        item["reason"] = _reason(older_than, min_size, min_tree_size)
         selected.append(item)
 
     warnings: list[str] = []
     if subagents == "tree":
         taken = {row.get("session_id") for row in selected}
+        live_roots: list[str] = []
         for root in sorted(selected, key=lambda item: item.get("thread_depth", 0)):
             root_id = root.get("session_id")
+            if skip_recently_active and root.get("tree_recently_active"):
+                # A live descendant makes the whole tree unsafe to move, not just that rollout.
+                live_roots.append(root_id)
+                continue
             stack = [(child, 1) for child in children.get(root_id, [])]
             while stack:
                 child, depth = stack.pop()
@@ -113,6 +124,15 @@ def apply_filters(
                 taken.add(child_id)
                 selected.append(item)
                 stack.extend((grand, depth + 1) for grand in children.get(child_id, []))
+        if live_roots:
+            live = set(live_roots)
+            selected = [item for item in selected if item.get("session_id") not in live]
+            listed = ", ".join(sorted(live)[:4])
+            more = " ..." if len(live) > 4 else ""
+            warnings.append(
+                f"{len(live)} selected tree(s) contain a rollout touched in the last few minutes "
+                f"and were left out entirely: {listed}{more}"
+            )
     elif blocked:
         warnings.append(
             f"{len(set(blocked))} subagent thread(s) have a parent issue and stay out of every tree"

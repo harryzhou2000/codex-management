@@ -121,6 +121,34 @@ class TreeResolutionTests(unittest.TestCase):
         )
         self.assertEqual([item["session_id"] for item in selected], ["guardian"])
 
+    def test_min_tree_size_measures_the_whole_tree(self):
+        rows = [
+            row("main", source="user", size=10, tree_bytes=5 * 1024**3),
+            row("small-main", source="user", size=10, tree_bytes=1024),
+        ]
+        selected, _ = selection.apply_filters(
+            rows, older_than=OLDER, min_size=None, min_tree_size="1GiB"
+        )
+        self.assertEqual([item["session_id"] for item in selected], ["main"])
+
+        by_row_size, _ = selection.apply_filters(rows, older_than=OLDER, min_size="1GiB")
+        self.assertEqual(by_row_size, [], "a 10-byte rollout never passes a row-size floor")
+
+    def test_tree_with_live_descendant_is_left_out_entirely(self):
+        rows = [
+            row("main", source="user", size=2 * 1024**3, tree_recently_active=True),
+            row("a", parent="main"),
+            row("other", source="user", size=2 * 1024**3, tree_recently_active=False),
+        ]
+        selected, warnings = selection.apply_filters(rows, older_than=OLDER, min_size=MIN)
+        self.assertEqual({item["session_id"] for item in selected}, {"other"})
+        self.assertTrue(any("last few minutes" in warning for warning in warnings))
+
+        selected, _ = selection.apply_filters(
+            rows, older_than=OLDER, min_size=MIN, skip_recently_active=False
+        )
+        self.assertIn("main", {item["session_id"] for item in selected})
+
 
 if __name__ == "__main__":
     unittest.main()
