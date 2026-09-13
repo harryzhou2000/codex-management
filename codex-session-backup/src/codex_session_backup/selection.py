@@ -18,6 +18,15 @@ from typing import Iterable
 from . import util
 
 MAIN_SOURCE = "user"
+DISABLED_VALUES = {"", "none", "off", "0"}
+
+
+def _optional_size(value: str | None) -> int | None:
+    """None disables the criterion; accepts none/off/0 as explicit ways to say so."""
+
+    if value is None or value.strip().lower() in DISABLED_VALUES:
+        return None
+    return util.parse_size(value)
 
 
 def _reason(older_than: str | None, min_size: str | None, min_tree_size: str | None = None) -> str:
@@ -63,8 +72,8 @@ def apply_filters(
     """Criteria are ANDed; the date criterion means last activity strictly before that day."""
 
     cutoff = util.parse_date(older_than).timestamp() if older_than else None
-    floor = util.parse_size(min_size) if min_size else None
-    tree_floor = util.parse_size(min_tree_size) if min_tree_size else None
+    floor = _optional_size(min_size)
+    tree_floor = _optional_size(min_tree_size)
     catalog = list(rows)
     children, blocked = _children_index(catalog)
     wanted = {source.lower() for source in thread_sources}

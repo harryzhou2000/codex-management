@@ -13,6 +13,11 @@ from . import backup, catalog, paths, selection, util
 DEFAULT_OLDER_THAN = "2026-08-31"
 DEFAULT_MIN_SIZE = "1GiB"
 THREAD_SOURCES = ("user", "subagent", "guardian_review", "orphan", "any")
+DISABLED = {"", "none", "off", "0"}
+
+
+def _size_phrase(label: str, value: str) -> str:
+    return f"{label} > {value}" if value.strip().lower() not in DISABLED else f"no {label} floor"
 
 
 def _ellipsis(text: str, width: int) -> str:
@@ -121,9 +126,12 @@ def cmd_select(args: argparse.Namespace) -> int:
     _print_table(selected, columns, args.limit)
 
     print()
-    tree_part = f", tree total > {args.min_tree_size}" if args.min_tree_size else ""
+    tree_part = (
+        f", {_size_phrase('tree size', args.min_tree_size)}" if args.min_tree_size else ""
+    )
     print(
-        f"criteria: last activity before {args.older_than}, row size > {args.min_size}{tree_part}, "
+        f"criteria: last activity before {args.older_than}, "
+        f"{_size_phrase('row size', args.min_size)}{tree_part}, "
         f"thread_source={','.join(sources)}, subagents={args.subagents}"
     )
     print(
