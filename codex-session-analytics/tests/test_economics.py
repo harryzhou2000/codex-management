@@ -20,8 +20,8 @@ class EconomicsTests(unittest.TestCase):
         }
         calls = [call, dict(call)]
         items = [
-            {"kind": "message", "est_tokens": 20_000},
-            {"kind": "message", "est_tokens": 30_000},
+            {"kind": "message", "est_tokens": 100_000},
+            {"kind": "message", "est_tokens": 150_000},
             {"kind": "compaction", "replacement_tokens": 10_000},
         ]
         result = estimate(
@@ -36,6 +36,34 @@ class EconomicsTests(unittest.TestCase):
         self.assertEqual(result["rows"][0]["estimated_compactions"], 10)
         self.assertEqual(result["rows"][-1]["current"], True)
         self.assertLess(result["rows"][0]["cost_usd"], result["rows"][1]["cost_usd"])
+
+    def test_compaction_call_statistics_use_adjacent_token_records(self):
+        calls = [
+            {
+                "model": "gpt-6.1-sol",
+                "timestamp": "2026-11-11T12:00:00Z",
+                "input_tokens": 446_000,
+                "cached_input_tokens": 445_000,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 4_969,
+                "cost_usd": 0.5,
+            },
+            {
+                "model": "gpt-6.1-sol",
+                "timestamp": "2026-11-11T12:00:10Z",
+                "input_tokens": 61_202,
+                "cached_input_tokens": 12_544,
+                "cache_write_input_tokens": 0,
+                "output_tokens": 110,
+                "cost_usd": 0.1,
+            },
+        ]
+        items = [{"kind": "compaction", "timestamp": "2026-11-11T12:00:05Z", "replacement_tokens": 80_000}]
+        result = estimate(calls, items, PriceBook.load(), [380_000], fixed_calls=1)
+        self.assertEqual(result["observed_compactions"], 1)
+        self.assertEqual(result["compaction_input_tokens"], 446_000)
+        self.assertEqual(result["compaction_output_tokens"], 4_969)
+        self.assertEqual(result["summary_tokens"], 61_202)
 
 
 if __name__ == "__main__":

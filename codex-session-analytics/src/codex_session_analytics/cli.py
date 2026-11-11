@@ -560,8 +560,8 @@ def build_parser() -> argparse.ArgumentParser:
     economics.add_argument("session", help="session id, prefix, name, or cwd fragment")
     economics.add_argument(
         "--compact-lengths",
-        default="32k,64k,96k,128k,192k,256k,320k,380k",
-        help="comma-separated prompt caps (default: 32k..380k)",
+        default="272k,300k,380k,500k,800k,1m",
+        help="comma-separated compact lengths (default: 272k,300k,380k,500k,800k,1m)",
     )
     economics.add_argument(
         "--calls",

@@ -112,19 +112,25 @@ it elsewhere. A cache entry is reused only when the source path, size, and mtime
 
 ### `csa economics`
 
-Amortized compact-length estimate for one session. It uses the observed average summary size
-after compaction, observed average growth per call, the observed cache ratio, and a fixed total
-call count. Each simulated call adds the average growth to the current context; reaching the
-compact length resets it to the average summary size. GPT long-context surcharge is disabled.
+Amortized compact-length estimate for one session. It uses the observed average context after
+compaction, observed average growth per call, the observed cache ratio, and a fixed total work-call
+count. Each simulated call adds the average growth to the current context; reaching the compact
+length resets it to the average post-compaction context. GPT long-context surcharge is disabled.
+
+Compaction-generation cost is based on the record immediately before each `compacted` event. In
+`01a1aa46`, all 52 compacted events have a `token_usage_record` at ordinal-1; these are the summary
+calls. Their observed averages are used for input, output, and cache hit ratio. The next call's
+input is used as the post-compaction context size, because `replacement_history` also contains
+tool schemas and system context and overstates the summary output.
 
     uv run csa economics 01a1aa46 --last-hours 24
-    uv run csa economics 01a1aa46 --calls 2000 --compact-lengths 96k,128k,192k,256k,320k,380k
+    uv run csa economics 01a1aa46 --calls 2000 --compact-lengths 272k,300k,380k,500k
     uv run csa economics 01a1aa46 --last-hours 24 --out analytics/economics
 
-The output reports total cost, cost per simulated call, compaction count, and savings against
-the current 380k row. `--calls` fixes the total call count; otherwise the observed call count is
-used. Rows whose compact length is below the observed summary length are marked `below summary`
-because that summary cannot actually fit in that context.
+The output ranks candidates by total cost including compaction generation, reports context and
+summary-generation cost separately, and shows savings against the current 380k row. `--calls`
+fixes the work-call count; compaction calls are additional. Rows whose compact length is below the
+observed post-compaction context are marked `below summary` because that context cannot fit.
 
 ### `csa prices`
 

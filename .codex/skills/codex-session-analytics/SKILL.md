@@ -44,8 +44,9 @@ metadata:
 - `--granularity turn` snaps to turn ids; `--last-turns`, `--last-messages`, `--last-days`,
   `--last-hours`, `--since`, and `--until` restrict the extracted slice and its plot.
 - `--no-long-context-surcharge` on `stats`/`context`/`prices` uses GPT base rates. `economics`
-  reports both actual modes and models compact lengths from average summary size and per-call
-  growth at a fixed total call count; it disables the GPT surcharge.
+  reports both actual modes and ranks compact lengths from average post-compaction context,
+  per-call growth, and the observed summary call immediately before each `compacted` event; it
+  disables the GPT surcharge. Default candidates are 272k, 300k, 380k, 500k, 800k, 1m.
 
 ## Price table
 
