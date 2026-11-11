@@ -52,8 +52,9 @@ def _parse_time(value: str | None) -> datetime | None:
 
 
 class PriceBook:
-    def __init__(self, data: dict[str, Any]):
+    def __init__(self, data: dict[str, Any], *, apply_long_context: bool = True):
         self.data = data
+        self.apply_long_context = apply_long_context
         self.models: dict[str, dict[str, Any]] = data.get("models", {})
         self.aliases: dict[str, str] = {
             str(key).lower(): str(value) for key, value in data.get("aliases", {}).items()
@@ -64,12 +65,17 @@ class PriceBook:
         )
 
     @classmethod
-    def load(cls, override: str | Path | None = None) -> "PriceBook":
+    def load(
+        cls, override: str | Path | None = None, *, apply_long_context: bool = True
+    ) -> "PriceBook":
         data = json.loads(DEFAULT_PRICE_PATH.read_text(encoding="utf-8"))
         if override:
             payload = json.loads(Path(override).expanduser().read_text(encoding="utf-8"))
             data = _merge(data, payload)
-        return cls(data)
+        return cls(data, apply_long_context=apply_long_context)
+
+    def with_long_context(self, enabled: bool) -> "PriceBook":
+        return PriceBook(self.data, apply_long_context=enabled)
 
     def resolve(self, model: str | None) -> str | None:
         if not model:
@@ -125,7 +131,7 @@ class PriceBook:
                 "output": float(peak.get("output", rates["output"])),
             }
         long_policy = entry.get("long_context", self.long_context)
-        if isinstance(long_policy, dict) and tokens.get("input", 0) > int(
+        if self.apply_long_context and isinstance(long_policy, dict) and tokens.get("input", 0) > int(
             long_policy.get("threshold_input_tokens", 272000)
         ):
             rates["input"] *= float(long_policy.get("input_multiplier", 1.0))
@@ -133,6 +139,13 @@ class PriceBook:
             rates["cache_write"] *= float(long_policy.get("input_multiplier", 1.0))
             rates["output"] *= float(long_policy.get("output_multiplier", 1.0))
         return rates, entry
+
+    def has_long_context(self, model: str | None) -> bool:
+        key = self.resolve(model)
+        if key is None:
+            return False
+        policy = self.models[key].get("long_context", self.long_context)
+        return isinstance(policy, dict)
 
     def cost(
         self, tokens: Mapping[str, int], model: str | None, when: str | None = None

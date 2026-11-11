@@ -51,6 +51,9 @@ Per-session table, totals by thread kind and model, plus optional CSV/JSON and c
 Default sort is estimated cost. `--limit 0` prints every row. `--include-archives` indexes the
 zstd archive before reporting. `--refresh` reparses unchanged files.
 
+`stats`, `context`, and `prices` accept `--no-long-context-surcharge` to use each GPT model's
+base input/output rates even above the published long-context threshold.
+
 `--out DIR` writes:
 
 - `sessions.csv`, `sessions.json` - one row per logical session
@@ -106,6 +109,22 @@ Builds or refreshes the parsed-usage cache.
 
 The cache defaults to `~/.cache/codex-session-analytics/index.sqlite`. Use `--cache PATH` to put
 it elsewhere. A cache entry is reused only when the source path, size, and mtime match.
+
+### `csa economics`
+
+Amortized compact-length estimate for one session. It uses the observed average summary size
+after compaction, observed average growth per call, the observed cache ratio, and a fixed total
+call count. Each simulated call adds the average growth to the current context; reaching the
+compact length resets it to the average summary size. GPT long-context surcharge is disabled.
+
+    uv run csa economics 01a1aa46 --last-hours 24
+    uv run csa economics 01a1aa46 --calls 2000 --compact-lengths 96k,128k,192k,256k,320k,380k
+    uv run csa economics 01a1aa46 --last-hours 24 --out analytics/economics
+
+The output reports total cost, cost per simulated call, compaction count, and savings against
+the current 380k row. `--calls` fixes the total call count; otherwise the observed call count is
+used. Rows whose compact length is below the observed summary length are marked `below summary`
+because that summary cannot actually fit in that context.
 
 ### `csa prices`
 

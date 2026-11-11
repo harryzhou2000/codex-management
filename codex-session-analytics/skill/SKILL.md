@@ -17,6 +17,7 @@ metadata:
     uv run csa stats --out analytics/summary --plot
     uv run csa context <session-id-or-name> --out analytics/context
     uv run csa context <session-id-or-name> --granularity turn --last-turns 20
+    uv run csa economics <session-id-or-name> --last-hours 24
     uv run csa index --include-archives
 
 ## Reading the output
@@ -42,6 +43,9 @@ metadata:
   come from recorded usage and are the authoritative part.
 - `--granularity turn` snaps to turn ids; `--last-turns`, `--last-messages`, `--last-days`,
   `--last-hours`, `--since`, and `--until` restrict the extracted slice and its plot.
+- `--no-long-context-surcharge` on `stats`/`context`/`prices` uses GPT base rates. `economics`
+  reports both actual modes and models compact lengths from average summary size and per-call
+  growth at a fixed total call count; it disables the GPT surcharge.
 
 ## Price table
 

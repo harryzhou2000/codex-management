@@ -23,6 +23,14 @@ class PriceBookTests(unittest.TestCase):
         )
         self.assertAlmostEqual(cost.usd, 0.97, places=6)
 
+    def test_long_context_can_be_disabled(self):
+        book = PriceBook.load(apply_long_context=False)
+        cost = book.cost(
+            {"input": 300_000, "cached": 100_000, "cache_write": 0, "output": 10_000},
+            "gpt-6.1-sol",
+        )
+        self.assertAlmostEqual(cost.usd, 0.51, places=6)
+
     def test_deepseek_peak_and_off_peak(self):
         peak = self.book.cost(
             {"input": 1_000_000, "cached": 500_000, "cache_write": 0, "output": 100_000},

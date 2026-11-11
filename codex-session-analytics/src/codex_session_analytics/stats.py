@@ -123,7 +123,11 @@ def _difference(lifetime: TokenUsage, retained: TokenUsage) -> TokenUsage:
 
 
 def _aggregate_segments(
-    segments: list[dict], pricebook: PriceBook, fallback_model: str
+    segments: list[dict],
+    pricebook: PriceBook,
+    fallback_model: str,
+    *,
+    recompute_costs: bool = False,
 ) -> tuple[TokenUsage, TokenUsage, list[dict], float, float, int, int]:
     """Return lifetime, retained, model rows, cost, estimated cost, priced, unpriced."""
 
@@ -138,9 +142,10 @@ def _aggregate_segments(
     models: dict[str, dict] = {}
     for segment in segments:
         retained.add(_segment_usage(segment, "retained"))
-        retained_cost += float(segment.get("retained_cost_usd") or 0.0)
-        retained_priced += int(segment.get("retained_priced_tokens") or 0)
-        retained_unpriced += int(segment.get("retained_unpriced_tokens") or 0)
+        if not recompute_costs:
+            retained_cost += float(segment.get("retained_cost_usd") or 0.0)
+            retained_priced += int(segment.get("retained_priced_tokens") or 0)
+            retained_unpriced += int(segment.get("retained_unpriced_tokens") or 0)
         for model_row in segment.get("models") or []:
             name = str(model_row.get("model") or "unknown")
             entry = models.setdefault(
@@ -171,9 +176,38 @@ def _aggregate_segments(
             entry["reasoning_output_tokens"] += int(
                 model_row.get("retained_reasoning_output_tokens") or 0
             )
-            entry["cost_usd"] += float(model_row.get("retained_cost_usd") or 0.0)
-            entry["priced_tokens"] += int(model_row.get("retained_priced_tokens") or 0)
-            entry["unpriced_tokens"] += int(model_row.get("retained_unpriced_tokens") or 0)
+            if recompute_costs and pricebook.has_long_context(name):
+                model_usage = TokenUsage(
+                    input=int(model_row.get("retained_input_tokens") or 0),
+                    cached=int(model_row.get("retained_cached_input_tokens") or 0),
+                    cache_write=int(model_row.get("retained_cache_write_input_tokens") or 0),
+                    output=int(model_row.get("retained_output_tokens") or 0),
+                    reasoning=int(model_row.get("retained_reasoning_output_tokens") or 0),
+                )
+                cost = pricebook.cost(
+                    {
+                        "input": model_usage.input,
+                        "cached": model_usage.cached,
+                        "cache_write": model_usage.cache_write,
+                        "output": model_usage.output,
+                    },
+                    name,
+                    None,
+                )
+                entry["cost_usd"] += cost.usd or 0.0
+                entry["priced_tokens"] += cost.priced_tokens
+                entry["unpriced_tokens"] += cost.unpriced_tokens
+                retained_cost += cost.usd or 0.0
+                retained_priced += cost.priced_tokens
+                retained_unpriced += cost.unpriced_tokens
+            else:
+                entry["cost_usd"] += float(model_row.get("retained_cost_usd") or 0.0)
+                entry["priced_tokens"] += int(model_row.get("retained_priced_tokens") or 0)
+                entry["unpriced_tokens"] += int(model_row.get("retained_unpriced_tokens") or 0)
+                if recompute_costs:
+                    retained_cost += float(model_row.get("retained_cost_usd") or 0.0)
+                    retained_priced += int(model_row.get("retained_priced_tokens") or 0)
+                    retained_unpriced += int(model_row.get("retained_unpriced_tokens") or 0)
 
     if lifetime.total < retained.total:
         lifetime = retained
@@ -344,7 +378,10 @@ def collect_rows(
                 row.name_source = "context"
         if session_segments:
             lifetime, retained, model_rows, cost, estimated_cost, priced, unpriced = _aggregate_segments(
-                session_segments, pricebook, row.model
+                session_segments,
+                pricebook,
+                row.model,
+                recompute_costs=not pricebook.apply_long_context,
             )
             row.tokens = lifetime.total
             row.retained_tokens = retained.total

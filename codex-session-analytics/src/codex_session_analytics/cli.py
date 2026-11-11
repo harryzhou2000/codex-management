@@ -13,6 +13,9 @@ from typing import Any
 
 from .catalog import ThreadMeta, display_name, load_ledger, load_threads, ledger_index, meaningful
 from .context import build_payload, render_preview, render_turn_preview, write_context_outputs
+from .economics import estimate as estimate_economics
+from .economics import parse_lengths, render as render_economics
+from .economics import write_outputs as write_economics
 from .index import AnalyticsIndex
 from .paths import (
     archived_dir,
@@ -49,7 +52,10 @@ def _archive_root(args: argparse.Namespace) -> Path | None:
 
 
 def _pricebook(args: argparse.Namespace) -> PriceBook:
-    return PriceBook.load(args.prices)
+    return PriceBook.load(
+        args.prices,
+        apply_long_context=not getattr(args, "no_long_context_surcharge", False),
+    )
 
 
 def _cache(args: argparse.Namespace) -> Path:
@@ -383,10 +389,63 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_economics(args: argparse.Namespace) -> int:
+    home = _home(args)
+    archive_root = _archive_root(args)
+    book = _pricebook(args)
+    session_id, meta, record, paths, source = _resolve_session(args.session, home, archive_root)
+    summaries = [parse_rollout(path, book, collect_items=True) for path in paths]
+    summary = merge_summaries(summaries, book)
+    name, _ = display_name(meta, record)
+    cwd = (meta.cwd if meta else "") or str(record.get("cwd") if record else "") or summary.cwd
+    if name == "(untitled)":
+        name = f"(untitled) · {Path(cwd).name} · {session_id[:8]}" if cwd else f"(untitled) · {session_id[:8]}"
+    payload = build_payload(
+        summary,
+        name=name,
+        thread_source=(meta.thread_source if meta else "") or summary.thread_source,
+        cwd=cwd,
+        source=source,
+        max_chars=0,
+        granularity="message",
+        since=args.since,
+        until=args.until,
+        last_days=args.last_days,
+        last_hours=args.last_hours,
+    )
+    lengths = parse_lengths(args.compact_lengths)
+    result = estimate_economics(
+        payload["calls"],
+        payload["items"],
+        book,
+        lengths,
+        fixed_calls=args.calls,
+    )
+    print(f"session: {name} [{session_id}]")
+    print(
+        f"source: {source}  observed calls={result['calls']:,}  "
+        f"fixed calls={result['fixed_calls']:,}"
+    )
+    print()
+    print(render_economics(result))
+    print()
+    print(
+        "Model: fixed total calls; each call adds the observed average growth to the current "
+        "context, and reaching the compact length resets it to the observed average summary "
+        "length. GPT long-context surcharge is disabled."
+    )
+    if args.out:
+        out_dir = Path(args.out).expanduser()
+        for label, path in write_economics(result, out_dir).items():
+            print(f"wrote {label}: {path}")
+    return 0
+
+
 def cmd_prices(args: argparse.Namespace) -> int:
     book = _pricebook(args)
     rows = book.rows()
     print(f"prices as of {book.data.get('as_of', '?')} ({book.data.get('unit', 'per_1m_tokens')})")
+    print(f"long-context surcharge: {'enabled' if book.apply_long_context else 'disabled'}")
     print(
         f"{'model':<28} {'input':>9} {'cached':>9} {'cache write':>12} {'output':>9}  notes"
     )
@@ -420,6 +479,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quiet", action="store_true", help="suppress indexing progress")
 
 
+def _add_no_long_context(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--no-long-context-surcharge",
+        action="store_true",
+        help="use base GPT rates even above the published long-context threshold",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="csa",
@@ -430,6 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = subparsers.add_parser("stats", help="per-session table, totals, CSV/JSON, charts")
     _add_common(stats)
+    _add_no_long_context(stats)
     stats.add_argument("--limit", type=int, default=30, help="rows to print; 0 prints all")
     stats.add_argument("--all", action="store_true", help="print every row")
     stats.add_argument(
@@ -463,6 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     context = subparsers.add_parser("context", help="extract one session's context history and plot")
     _add_common(context)
+    _add_no_long_context(context)
     context.add_argument("session", help="session id, id prefix, name fragment, or cwd fragment")
     context.add_argument("--out", help="output directory (default: ./analytics/<session-id>)")
     context.add_argument("--max-chars", type=int, default=1000, help="per-item text cap; 0 = full")
@@ -484,8 +553,31 @@ def build_parser() -> argparse.ArgumentParser:
     context.add_argument("--preview", type=int, default=6, help="head/tail rows to print")
     context.set_defaults(func=cmd_context)
 
+    economics = subparsers.add_parser(
+        "economics", help="estimate session cost under different compact lengths"
+    )
+    _add_common(economics)
+    economics.add_argument("session", help="session id, prefix, name, or cwd fragment")
+    economics.add_argument(
+        "--compact-lengths",
+        default="32k,64k,96k,128k,192k,256k,320k,380k",
+        help="comma-separated prompt caps (default: 32k..380k)",
+    )
+    economics.add_argument(
+        "--calls",
+        type=int,
+        help="fixed total calls for the amortized estimate (default: observed calls)",
+    )
+    economics.add_argument("--last-days", type=float)
+    economics.add_argument("--last-hours", type=float)
+    economics.add_argument("--since")
+    economics.add_argument("--until")
+    economics.add_argument("--out", help="write economics.json and economics.csv")
+    economics.set_defaults(func=cmd_economics)
+
     prices = subparsers.add_parser("prices", help="show the effective model price table")
     _add_common(prices)
+    _add_no_long_context(prices)
     prices.add_argument("--json", help="write the effective price table as JSON")
     prices.set_defaults(func=cmd_prices)
     return parser
