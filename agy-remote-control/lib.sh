@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+note() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf 'warning: %s\n' "$*" >&2
+}
+
+AGY_BIN="${AGY_BIN:-agy}"
+if [[ "$AGY_BIN" != */* ]]; then
+    AGY_BIN="$(command -v -- "$AGY_BIN" 2>/dev/null || true)"
+fi
+[[ -n "$AGY_BIN" && -x "$AGY_BIN" ]] || die "agy executable not found; set AGY_BIN to its path"
+AGY_BIN="$(readlink -f -- "$AGY_BIN")"
+
+AGY_UNIT="${AGY_UNIT:-antigravity-cli-daemon.service}"
+AGY_MGMT_CONFIG_DIR="${AGY_MGMT_CONFIG_DIR:-$HOME/.config/agy-remote-control}"
+NETWORK_ENV_FILE="$AGY_MGMT_CONFIG_DIR/network.env"
+SYSTEMD_USER_DIR="${SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+NETWORK_DROPIN_DIR="$SYSTEMD_USER_DIR/$AGY_UNIT.d"
+NETWORK_DROPIN_FILE="$NETWORK_DROPIN_DIR/10-network.conf"
+PROXY_ENV_FILE="${PROXY_ENV_FILE:-$HOME/.setproxy.sh}"
+PROXY_VARS=(HTTP_PROXY HTTPS_PROXY ALL_PROXY NO_PROXY http_proxy https_proxy all_proxy no_proxy)
+
+pid_cmdline() {
+    local pid="$1"
+    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true
+}
+
+is_agy_executable() {
+    local pid="$1" exe
+    exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+    [[ -n "$exe" && "$exe" == "$AGY_BIN" ]]
+}
+
+is_daemon_pid() {
+    local pid="$1" cmd
+    [[ -n "$pid" ]] || return 1
+    is_agy_executable "$pid" || return 1
+    cmd=" $(pid_cmdline "$pid") "
+    [[ "$cmd" == *" remote-control serve "* ]]
+}
+
+daemon_pids() {
+    local pid
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        is_daemon_pid "$pid" || continue
+        printf '%s\n' "$pid"
+    done < <(pgrep -u "$(id -u)" -f 'remote-control serve' 2>/dev/null || true)
+}
+
+daemon_running() {
+    [[ -n "$(daemon_pids)" ]]
+}
+
+service_active() {
+    systemctl --user is-active --quiet "$AGY_UNIT" 2>/dev/null
+}
+
+daemon_present() {
+    service_active || daemon_running
+}
+
+service_loaded() {
+    local state
+    state="$(systemctl --user show -p LoadState --value "$AGY_UNIT" 2>/dev/null || true)"
+    [[ "$state" == loaded ]]
+}
+
+managed_daemon_pid() {
+    local pid
+    pid="$(systemctl --user show -p MainPID --value "$AGY_UNIT" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" -gt 0 ]] && is_daemon_pid "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+    fi
+
+    pid="$(daemon_pids | head -n 1)"
+    [[ -n "$pid" ]] || return 1
+    printf '%s\n' "$pid"
+}
+
+read_environ_value() {
+    local pid="$1" name="$2"
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
+        sed -n "s/^$name=//p" |
+        head -n 1
+}
+
+has_environ_var() {
+    local pid="$1" name="$2"
+    tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null |
+        grep -q "^$name="
+}
+
+daemon_proxy_env_names() {
+    local pid="$1" name value names=()
+    for name in "${PROXY_VARS[@]}"; do
+        value="$(read_environ_value "$pid" "$name")"
+        [[ -n "$value" ]] && names+=("$name")
+    done
+    local IFS=,
+    printf '%s' "${names[*]}"
+}
+
+assert_not_inside_daemon() {
+    local pid="$$" parent
+    while [[ "$pid" -gt 1 ]]; do
+        if is_daemon_pid "$pid"; then
+            die "refusing to replace the remote-control daemon from inside it; run this script from an independent terminal or SSH shell"
+        fi
+        parent="$(awk '/^PPid:/{print $2}' "/proc/$pid/status" 2>/dev/null || true)"
+        [[ "$parent" =~ ^[0-9]+$ && "$parent" -gt 0 ]] || break
+        pid="$parent"
+    done
+}
+
+set_network_mode() {
+    local mode="$1" name have_proxy=false
+    case "$mode" in
+        proxy)
+            [[ -r "$PROXY_ENV_FILE" ]] || die "proxy environment file is not readable: $PROXY_ENV_FILE"
+            # shellcheck disable=SC1090
+            source "$PROXY_ENV_FILE"
+            for name in "${PROXY_VARS[@]}"; do
+                [[ -v "$name" ]] && export "$name"
+            done
+            for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+                if [[ -v "$name" && -n "${!name}" ]]; then
+                    have_proxy=true
+                    break
+                fi
+            done
+            $have_proxy || die "proxy environment file did not define HTTP_PROXY, HTTPS_PROXY, or ALL_PROXY: $PROXY_ENV_FILE"
+            ;;
+        no-proxy)
+            for name in "${PROXY_VARS[@]}"; do
+                unset "$name" 2>/dev/null || true
+            done
+            ;;
+        *) die "unknown network mode: $mode" ;;
+    esac
+}
+
+systemd_env_quote() {
+    local value="$1" escaped
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "proxy variable value contains a newline or carriage return"
+    escaped="${value//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    printf '"%s"' "$escaped"
+}
+
+write_network_env_file() {
+    local tmp name
+    install -d -m 0700 "$AGY_MGMT_CONFIG_DIR"
+    tmp="$(mktemp "$AGY_MGMT_CONFIG_DIR/.network.env.XXXXXX")"
+    chmod 0600 "$tmp"
+    {
+        printf '# Generated by agy-remote-control/start.sh. Contains proxy credentials.\n'
+        for name in "${PROXY_VARS[@]}"; do
+            if [[ -v "$name" ]]; then
+                printf '%s=%s\n' "$name" "$(systemd_env_quote "${!name}")"
+            else
+                printf '%s=""\n' "$name"
+            fi
+        done
+    } >"$tmp"
+    mv -f -- "$tmp" "$NETWORK_ENV_FILE"
+    chmod 0600 "$NETWORK_ENV_FILE"
+}
+
+write_network_dropin() {
+    local mode="$1" tmp env_file_spec
+    install -d -m 0755 "$NETWORK_DROPIN_DIR"
+    tmp="$(mktemp "$NETWORK_DROPIN_DIR/.10-network.conf.XXXXXX")"
+    {
+        printf '# Managed by agy-remote-control/start.sh. Do not edit.\n'
+        printf '[Service]\n'
+        case "$mode" in
+            proxy)
+                env_file_spec="$NETWORK_ENV_FILE"
+                if [[ "$env_file_spec" == "$HOME/"* ]]; then
+                    env_file_spec="%h/${env_file_spec#"$HOME/"}"
+                fi
+                printf 'EnvironmentFile=-%s\n' "$env_file_spec"
+                ;;
+            no-proxy)
+                printf 'UnsetEnvironment=%s\n' "${PROXY_VARS[*]}"
+                ;;
+            *) die "unknown network mode: $mode" ;;
+        esac
+    } >"$tmp"
+    chmod 0644 "$tmp"
+    mv -f -- "$tmp" "$NETWORK_DROPIN_FILE"
+    if ! systemctl --user daemon-reload; then
+        warn "systemctl --user daemon-reload failed; the daemon may use a stale unit"
+    fi
+}
+
+write_network_mode() {
+    local mode="$1"
+    case "$mode" in
+        proxy)
+            write_network_env_file
+            write_network_dropin proxy
+            ;;
+        no-proxy) write_network_dropin no-proxy ;;
+        *) die "unknown network mode: $mode" ;;
+    esac
+}
+
+daemon_network_matches() {
+    local mode="$1" pid name expected actual have_proxy=false
+    pid="$(managed_daemon_pid)" || return 1
+
+    case "$mode" in
+        proxy)
+            for name in "${PROXY_VARS[@]}"; do
+                if [[ -v "$name" ]]; then
+                    expected="${!name}"
+                else
+                    expected=""
+                fi
+                if has_environ_var "$pid" "$name"; then
+                    actual="$(read_environ_value "$pid" "$name")"
+                else
+                    actual=""
+                fi
+                [[ "$actual" == "$expected" ]] || return 1
+            done
+            for name in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
+                if [[ -n "$(read_environ_value "$pid" "$name")" ]]; then
+                    have_proxy=true
+                    break
+                fi
+            done
+            $have_proxy
+            ;;
+        no-proxy)
+            for name in "${PROXY_VARS[@]}"; do
+                has_environ_var "$pid" "$name" && return 1
+            done
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_daemon_network_mode() {
+    local mode="$1" pid names
+    pid="$(managed_daemon_pid)" || die "remote-control daemon did not appear"
+    daemon_network_matches "$mode" || die "daemon pid $pid does not match network_mode=$mode"
+    names="$(daemon_proxy_env_names "$pid")"
+    note "managed daemon pid=$pid verified network_mode=$mode proxy_env=${names:-none}"
+}
+
+wait_for_daemon() {
+    local timeout="${1:-20}" deadline pid
+    deadline=$((SECONDS + timeout))
+    while ((SECONDS < deadline)); do
+        if pid="$(managed_daemon_pid)"; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+wait_for_daemon_gone() {
+    local timeout="${1:-30}" deadline
+    deadline=$((SECONDS + timeout))
+    while ((SECONDS < deadline)); do
+        daemon_running || return 0
+        sleep 0.2
+    done
+    daemon_running && return 1
+    return 0
+}
+
+current_instance_name() {
+    local name
+    name="$("$AGY_BIN" remote-control status 2>/dev/null |
+        sed -n 's/^Instance name: //p' |
+        head -n 1 || true)"
+    name="${name%% (find it at *}"
+    printf '%s\n' "$name"
+}
+
+show_daemon() {
+    local pid names cmd
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] || continue
+        names="$(daemon_proxy_env_names "$pid")"
+        cmd="$(pid_cmdline "$pid")"
+        printf 'pid=%s proxy_env=%s\n  %s\n' "$pid" "${names:-none}" "$cmd"
+    done < <(daemon_pids)
+}

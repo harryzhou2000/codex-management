@@ -1,9 +1,11 @@
 # codex-management
 
-Local tooling for keeping Codex data manageable.
+Local tooling for managing Codex data and Antigravity remote-control services.
 
 - codex-app-server/ - inspect, purge, start, or replace the managed Codex app-server with an
   explicit proxied or direct network environment while preserving session and configuration data.
+- agy-remote-control/ - inspect, stop, start, or gracefully replace the Antigravity
+  remote-control daemon, with explicit proxied or direct systemd service environments.
 - codex-session-backup/ - catalog Codex sessions, choose what to back up or prune, compress
   rollouts into an archive, verify hashes, then remove sessions through the Codex CLI. Its
   README documents the safety model, criteria semantics, and restore steps.
@@ -25,6 +27,11 @@ Local tooling for keeping Codex data manageable.
     uv run csb backup --plan plans/plan-2026-08-31-1gib.json --apply    # compress + verify
 
 Standard library only. zstd is the one external binary the backup step needs.
+
+Antigravity remote control:
+
+    ./agy-remote-control/status.sh
+    ./agy-remote-control/replace.sh --proxy
 
 Session analytics:
 
